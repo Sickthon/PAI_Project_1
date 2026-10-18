@@ -1,5 +1,8 @@
 import os
 import typing
+
+import scipy
+from sklearn import cluster
 from sklearn.gaussian_process.kernels import *
 import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -28,18 +31,55 @@ class Model(object):
         Initialize your model here.
         We already provide a random number generator for reproducibility.
         """
+        self.train_x = None
+        self.train_y = None
+        self.km = None
+        self.centers = None
+        self.kd_tree = None
+        self.gps = None
+        self.k = 10
         self.rng = np.random.default_rng(seed=0)
 
-        kernel = ConstantKernel(1.0, (1e-2, 1e2)) * Matern(length_scale=0.2,
-                                 length_scale_bounds=(1e-2, 1e1), nu=0.5) \
-    + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-6, 1e0)) \
-                 + ConstantKernel(1.0, (1e-2, 1e2)) * DotProduct(sigma_0=1.0)
-        self.gpc = GaussianProcessRegressor(kernel=kernel,
-                                       random_state=42, normalize_y=True, n_restarts_optimizer=1)
+        self.create_gp()
+
         # Given that we penalize underpredictions with w=50 in residential areas, this minimizes the expected loss
         # between our Gaussian processs f and our prediction p -> We choose the 93.1 percentile
         self.optimal_scale = 1.485
+    
+    def create_gp(self):
+        """
+        Create a Gaussian process for each local gp.
+        """
+        kernel = ConstantKernel(1.0, (1e-2, 1e2)) * Matern(length_scale=0.2,
+                                                           length_scale_bounds=(1e-2, 1e1), nu=1.5) \
+                 + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-6, 1e0))
 
+        self.gps = [GaussianProcessRegressor(kernel=kernel,
+                                             random_state=42, normalize_y=True, n_restarts_optimizer=1) for _ in
+                    range(self.k)]
+
+    
+    
+    def create_dataset(self, train_coordinates: np.ndarray, train_pollution_targets: np.ndarray):
+        """
+        Create a dataset for each local gp.
+        """
+        
+        # Find centers for GPs
+        self.find_centers(train_coordinates)
+
+        labels = self.km.labels_  # (n,) cluster index per training point
+
+        leaves = [np.where(labels == i)[0] for i in range(self.k)]  # list of index arrays
+
+        # Analysis
+        sizes = np.array([len(leaf) for leaf in leaves])  # or: np.bincount(labels, minlength=self.k)
+        print(f"Points per cluster: {sizes.tolist()}")
+        print(f"min={sizes.min()}, max={sizes.max()}, mean={sizes.mean():.1f}")
+
+        self.train_x = [train_coordinates[idx] for idx in leaves]  # list of (n_i, d)
+        self.train_y = [train_pollution_targets[idx] for idx in leaves]  # list of (n_i,)
+    
     # Don't change the name or the signature of this function
     def fit_model(self, train_coordinates: np.ndarray, train_pollution_targets: np.ndarray, train_residential_flags: np.ndarray):
         """
@@ -48,16 +88,10 @@ class Model(object):
         :param train_pollution_targets: Training pollution concentrations as a 1d NumPy float array of shape (NUM_SAMPLES,)
         :param train_residential_flags: Binary variable denoting whether the 2D training point is in the residential area (1) or not (0)
         """
+        self.create_dataset(train_coordinates, train_pollution_targets)
 
-        X = train_coordinates
-        y = train_pollution_targets
-        # select random subset for training
-        X_train, _, y_train, _ = train_test_split(X, y, test_size=0.7, random_state=42)
-
-        print("Training data shape:", X_train.shape, y_train.shape)
-
-        self.gpc.fit(X_train, y_train)
-
+        for gp, X_train, y_train in zip(self.gps, self.train_x, self.train_y):
+            gp.fit(X_train, y_train)
 
     # Don't change the name or the signature of this function
     def predict_pollution(self, test_coordinates: np.ndarray, test_residential_flags: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -70,13 +104,50 @@ class Model(object):
             containing your predictions, the GP posterior mean, and the GP posterior stddev (in that order)
         """
 
-        # TODO: Use your GP to estimate the posterior mean and stddev for each city_area here
-        gp_mean, gp_std = self.gpc.predict(test_coordinates, return_std=True)
+        "Find models for data point"
+        index = self.km.predict(test_coordinates)
 
-        # TODO: Use the GP posterior to form your predictions here
-        predictions = gp_mean + self.optimal_scale*gp_std*test_residential_flags
+        order = np.argsort(index, kind='stable')  # test points sorted by GP
+        bounds = np.cumsum(np.bincount(index, minlength=self.k))[:-1]
+        groups = np.split(order, bounds)  # groups[i] = test indices for GP i
+
+        gp_mean = np.empty(len(test_coordinates))
+        gp_std = np.empty(len(test_coordinates))
+        predictions = np.empty(len(test_coordinates))
+
+        for gp, idx in zip(self.gps, groups):
+            if len(idx) == 0:
+                continue
+            m, s = gp.predict(test_coordinates[idx], return_std=True)
+            gp_mean[idx] = m
+            gp_std[idx] = s ** 2
+            # Todo Subtract std of noise
+            predictions[idx] = m + self.optimal_scale*s*test_residential_flags[idx]
 
         return predictions, gp_mean, gp_std
+
+    def find_centers(self, train_coordinates: np.ndarray):
+        """
+        Find the centers for the k local GPs
+        """
+        self.km = cluster.KMeans(
+            n_clusters=self.k, init='k-means++', n_init='auto', max_iter=300,
+            tol=1e-4, verbose=0, random_state=42, copy_x=True, algorithm='lloyd'
+        ).fit(train_coordinates)
+
+        self.centers = self.km.cluster_centers_
+
+
+
+    def create_kdtree(self, train_coordinates):
+        """
+        Create a k-d tree for X_train. We want to find the nearest neighbors for each of the centers.
+        """
+        self.kd_tree= scipy.spatial.cKDTree(
+            train_coordinates, leafsize=16, compact_nodes=True, copy_data=False,
+            balanced_tree=True, boxsize=None
+        )
+
 
 # You don't have to change this function
 def calculate_cost(ground_truth: np.ndarray, predictions: np.ndarray, residential_flags: np.ndarray) -> float:
@@ -180,7 +251,7 @@ def perform_extended_model_evaluation(model: Model, output_dir: str = '/results'
 
     plt.show()
 
-# You do not need to change the name or the signature of this function; convenience helper used by main() 
+# You do not need to change the name or the signature of this function; convenience helper used by main()
 def get_city_area_data(train_x: np.ndarray, test_x: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Extracts the city_area information from the training and test features.
@@ -196,7 +267,6 @@ def get_city_area_data(train_x: np.ndarray, test_x: np.ndarray) -> typing.Tuple[
 
     train_coordinates = train_x[:, :2]
     train_residential_flags = train_x[:, 2].astype(bool)
-    # Todo create val dataset
     test_coordinates = test_x[:, :2]
     test_residential_flags = test_x[:, 2].astype(bool)
 
@@ -230,9 +300,9 @@ def main():
     model = Model()
     model.fit_model(train_coordinates, train_y, train_residential_flags)
 
-    print("kernel :", model.gpc.kernel_)
+    """print("kernel :", model.gpc.kernel_)
     # e.g. 0.8**2 * Matern(length_scale=[0.31, 0.29], nu=1.5) + 0.5**2 * Matern(length_scale=[0.03, 0.03], nu=1.5) + WhiteKernel(noise_level=2.1)
-    print("log_marginal_likelihood:", model.gpc.log_marginal_likelihood_value_)
+    print("log_marginal_likelihood:", model.gpc.log_marginal_likelihood_value_)"""
 
     # Predict on the test features
     print('Predicting on test features')
