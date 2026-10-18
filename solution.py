@@ -224,7 +224,7 @@ def perform_extended_model_evaluation(model: Model, output_dir: str = '/results'
     print('Performing extended evaluation')
 
     # Visualize on a uniform grid over the entire coordinate system
-    grid_lat, grid_lon = np.meshgrid(
+    grid_lon, grid_lat = np.meshgrid(
         np.linspace(0, EVALUATION_GRID_POINTS - 1, num=EVALUATION_GRID_POINTS) / EVALUATION_GRID_POINTS,
         np.linspace(0, EVALUATION_GRID_POINTS - 1, num=EVALUATION_GRID_POINTS) / EVALUATION_GRID_POINTS,
     )
@@ -241,7 +241,7 @@ def perform_extended_model_evaluation(model: Model, output_dir: str = '/results'
     # Plot the actual predictions
     fig, ax = plt.subplots()
     ax.set_title('Extended visualization of task 1')
-    im = ax.imshow(predictions, vmin=vmin, vmax=vmax)
+    im = ax.imshow(predictions, origin='lower', vmin=vmin, vmax=vmax)
     cbar = fig.colorbar(im, ax=ax)
 
     # Save figure to pdf
