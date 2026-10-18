@@ -1,13 +1,12 @@
 import os
 import typing
-
-import scipy
+from joblib import Parallel, delayed
+from scipy.spatial import cKDTree
 from sklearn import cluster
 from sklearn.gaussian_process.kernels import *
 import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 import matplotlib.pyplot as plt
-from matplotlib import cm
 from sklearn.model_selection import train_test_split
 
 # Set `EXTENDED_EVALUATION` to `True` in order to visualize your predictions.
@@ -35,9 +34,12 @@ class Model(object):
         self.train_y = None
         self.km = None
         self.centers = None
-        self.kd_tree = None
+        self.leaves = None
         self.gps = None
-        self.k = 10
+        self.k = 15
+        self.overlap_tau = 4  # None -> disjoint clusters
+        self.n_neighbors = 3  # how many nearest centers are considered per point
+        self.nu = 1.5
         self.rng = np.random.default_rng(seed=0)
 
         self.create_gp()
@@ -58,27 +60,32 @@ class Model(object):
                                              random_state=42, normalize_y=True, n_restarts_optimizer=1) for _ in
                     range(self.k)]
 
-    
-    
     def create_dataset(self, train_coordinates: np.ndarray, train_pollution_targets: np.ndarray):
         """
         Create a dataset for each local gp.
         """
-        
-        # Find centers for GPs
         self.find_centers(train_coordinates)
 
-        labels = self.km.labels_  # (n,) cluster index per training point
+        labels = self.km.labels_
+        disjoint = [np.where(labels == i)[0] for i in range(self.k)]
+        sizes = np.array([len(l) for l in disjoint])
+        print(f"Disjoint points per cluster: {sizes.tolist()}")
 
-        leaves = [np.where(labels == i)[0] for i in range(self.k)]  # list of index arrays
+        if self.overlap_tau is None:
+            leaves = disjoint
+        else:
+            leaves = self.build_overlapping_leaves(train_coordinates)
+            new_sizes = np.array([len(l) for l in leaves])
+            # sanity checks
+            assert all(np.isin(d, l).all() for d, l in zip(disjoint, leaves))  # superset of the cluster
+            assert len(np.unique(np.concatenate(leaves))) == len(train_coordinates)  # full coverage
+            print(f"Overlapping points per GP: {new_sizes.tolist()}")
+            print(f"Growth factor: min={np.min(new_sizes / sizes):.2f}, "
+                  f"mean={np.mean(new_sizes / sizes):.2f}, max={np.max(new_sizes / sizes):.2f}")
 
-        # Analysis
-        sizes = np.array([len(leaf) for leaf in leaves])  # or: np.bincount(labels, minlength=self.k)
-        print(f"Points per cluster: {sizes.tolist()}")
-        print(f"min={sizes.min()}, max={sizes.max()}, mean={sizes.mean():.1f}")
-
-        self.train_x = [train_coordinates[idx] for idx in leaves]  # list of (n_i, d)
-        self.train_y = [train_pollution_targets[idx] for idx in leaves]  # list of (n_i,)
+        self.leaves = leaves
+        self.train_x = [train_coordinates[idx] for idx in leaves]
+        self.train_y = [train_pollution_targets[idx] for idx in leaves]
     
     # Don't change the name or the signature of this function
     def fit_model(self, train_coordinates: np.ndarray, train_pollution_targets: np.ndarray, train_residential_flags: np.ndarray):
@@ -90,11 +97,56 @@ class Model(object):
         """
         self.create_dataset(train_coordinates, train_pollution_targets)
 
-        for gp, X_train, y_train in zip(self.gps, self.train_x, self.train_y):
-            gp.fit(X_train, y_train)
+        def _fit(gp, X, y):
+            return gp.fit(X, y)
+
+        self.gps = Parallel(n_jobs=-1)(
+            delayed(_fit)(gp, X, y) for gp, X, y in zip(self.gps, self.train_x, self.train_y))
+        for i, gp in enumerate(self.gps):
+            print(f"GP {i}: n={len(self.train_x[i])}, kernel={gp.kernel_}, "
+                  f"LML={gp.log_marginal_likelihood_value_:.2f}")
+
+
+        # Don't change the name or the signature of this function
+
+    def _predict_blended(self, X: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray]:
+        """
+        Blend the predictions of the nearby local GPs. A GP has weight 1 at the nearest-center
+        boundary and ramps down to 0 at distance tau * (distance to the nearest center),
+        which matches the rule used to build the overlapping training sets.
+        """
+        n = len(X)
+        nb = min(self.n_neighbors, self.k)
+
+        dist, nn = cKDTree(self.centers).query(X, k=nb)
+        dist, nn = dist.reshape(n, -1), nn.reshape(n, -1)  # k=1 returns 1D arrays
+
+        means = np.zeros((n, nb))
+        stds = np.zeros((n, nb))
+        for j, gp in enumerate(self.gps):
+            rows, cols = np.nonzero(nn == j)
+            if len(rows) == 0:
+                continue
+            m, s = gp.predict(X[rows], return_std=True)
+            noise = gp.kernel_.k2.noise_level * gp._y_train_std ** 2  # noise variance in target units
+            means[rows, cols] = m
+            stds[rows, cols] = np.sqrt(np.maximum(s ** 2 - noise, 0.0))
+
+        if self.overlap_tau is None or self.overlap_tau <= 1.0 or nb == 1:
+            w = np.zeros((n, nb));
+            w[:, 0] = 1.0  # hard assignment to the nearest GP
+        else:
+            ratio = dist / np.maximum(dist[:, [0]], 1e-12)
+            w = np.clip(1 - (ratio - 1) / (self.overlap_tau - 1), 0, 1)
+            w /= w.sum(axis=1, keepdims=True)  # nearest GP always has w=1, so sum > 0
+
+        mean = (w * means).sum(axis=1)
+        var = (w * (stds ** 2 + means ** 2)).sum(axis=1) - mean ** 2  # mixture variance
+        return mean, np.sqrt(np.maximum(var, 0.0))
 
     # Don't change the name or the signature of this function
-    def predict_pollution(self, test_coordinates: np.ndarray, test_residential_flags: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def predict_pollution(self, test_coordinates: np.ndarray, test_residential_flags: np.ndarray) -> typing.Tuple[
+        np.ndarray, np.ndarray, np.ndarray]:
         """
         Predict the pollution concentration for a given set of city_areas.
         :param test_coordinates: city_areas as a 2d NumPy float array of shape (NUM_SAMPLES, 2)
@@ -103,26 +155,9 @@ class Model(object):
             Tuple of three 1d NumPy float arrays, each of shape (NUM_SAMPLES,),
             containing your predictions, the GP posterior mean, and the GP posterior stddev (in that order)
         """
+        gp_mean, gp_std = self._predict_blended(test_coordinates)
 
-        "Find models for data point"
-        index = self.km.predict(test_coordinates)
-
-        order = np.argsort(index, kind='stable')  # test points sorted by GP
-        bounds = np.cumsum(np.bincount(index, minlength=self.k))[:-1]
-        groups = np.split(order, bounds)  # groups[i] = test indices for GP i
-
-        gp_mean = np.empty(len(test_coordinates))
-        gp_std = np.empty(len(test_coordinates))
-        predictions = np.empty(len(test_coordinates))
-
-        for gp, idx in zip(self.gps, groups):
-            if len(idx) == 0:
-                continue
-            m, s = gp.predict(test_coordinates[idx], return_std=True)
-            gp_mean[idx] = m
-            gp_std[idx] = s ** 2
-            # Todo Subtract std of noise
-            predictions[idx] = m + self.optimal_scale*s*test_residential_flags[idx]
+        predictions = gp_mean + self.optimal_scale * gp_std * test_residential_flags
 
         return predictions, gp_mean, gp_std
 
@@ -137,16 +172,35 @@ class Model(object):
 
         self.centers = self.km.cluster_centers_
 
-
-
-    def create_kdtree(self, train_coordinates):
+    def build_overlapping_leaves(self, train_coordinates: np.ndarray) -> typing.List[np.ndarray]:
         """
-        Create a k-d tree for X_train. We want to find the nearest neighbors for each of the centers.
+        Soft assignment: a training point joins GP j if its distance to center j is at most
+        tau * (distance to its nearest center). Points deep inside a cluster stay in one GP,
+        points near a boundary join several. The original k-means cluster is always included.
         """
-        self.kd_tree= scipy.spatial.cKDTree(
-            train_coordinates, leafsize=16, compact_nodes=True, copy_data=False,
-            balanced_tree=True, boxsize=None
-        )
+        n = len(train_coordinates)
+        labels = self.km.labels_
+        n_nbrs = min(self.n_neighbors, self.k)
+
+        center_tree = cKDTree(self.centers)
+        dist, nn = center_tree.query(train_coordinates, k=n_nbrs, workers=-1)
+        dist = dist.reshape(n, -1)  # k=1 returns 1D arrays
+        nn = nn.reshape(n, -1)
+
+        keep = dist <= self.overlap_tau * dist[:, [0]]
+        keep[:, 0] = True
+
+        # (point, gp) pairs from the soft assignment, plus the k-means label of each point
+        pt_idx, col = np.nonzero(keep)
+        gp_idx = nn[pt_idx, col]
+        pt_idx = np.concatenate([pt_idx, np.arange(n)])
+        gp_idx = np.concatenate([gp_idx, labels])
+
+        # Group points by GP in one sort instead of looping over all points
+        order = np.argsort(gp_idx, kind='stable')
+        pt_sorted, gp_sorted = pt_idx[order], gp_idx[order]
+        bounds = np.searchsorted(gp_sorted, np.arange(1, self.k))
+        return [np.unique(a) for a in np.split(pt_sorted, bounds)]  # unique -> sorted, no duplicates
 
 
 # You don't have to change this function
