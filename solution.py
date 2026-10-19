@@ -36,9 +36,9 @@ class Model(object):
         self.centers = None
         self.leaves = None
         self.gps = None
-        self.k = 25
-        self.overlap_tau = 3.5  # None -> disjoint clusters
-        self.n_neighbors = 3  # how many nearest centers are considered per point
+        self.k = 100
+        self.overlap_tau = 8  # None -> disjoint clusters
+        self.n_neighbors = 8  # how many nearest centers are considered per point
         self.nu = 1.5
         self.rng = np.random.default_rng(seed=0)
 
@@ -295,8 +295,22 @@ def perform_extended_model_evaluation(model: Model, output_dir: str = '/results'
     # Plot the actual predictions
     fig, ax = plt.subplots()
     ax.set_title('Extended visualization of task 1')
-    im = ax.imshow(predictions, origin='lower', vmin=vmin, vmax=vmax)
+
+    # extent maps the image onto the [0, 1] x [0, 1] coordinate system
+    # (the grid goes from 0 to (N-1)/N, so this is accurate to within one pixel)
+    im = ax.imshow(predictions, origin='lower', vmin=vmin, vmax=vmax,
+                   extent=(0, 1, 0, 1))
     cbar = fig.colorbar(im, ax=ax)
+
+    # Overlay the cluster centers of the local GPs
+    if model.centers is not None:
+        ax.scatter(model.centers[:, 0], model.centers[:, 1],
+                   c='red', marker='x', s=25, linewidths=1.2,
+                   label='GP centers')
+        ax.legend(loc='upper right')
+
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
 
     # Save figure to pdf
     figure_path = os.path.join(output_dir, 'extended_evaluation.pdf')
