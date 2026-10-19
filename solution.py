@@ -36,8 +36,8 @@ class Model(object):
         self.centers = None
         self.leaves = None
         self.gps = None
-        self.k = 15
-        self.overlap_tau = 4  # None -> disjoint clusters
+        self.k = 25
+        self.overlap_tau = 3.5  # None -> disjoint clusters
         self.n_neighbors = 3  # how many nearest centers are considered per point
         self.nu = 1.5
         self.rng = np.random.default_rng(seed=0)
